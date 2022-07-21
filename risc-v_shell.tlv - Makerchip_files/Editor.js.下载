@@ -1,0 +1,277 @@
+(function() {
+  var baseApi, ref,
+    boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  baseApi = (ref = window.BASE_API_URL) != null ? ref : "";
+
+  require.config({
+    packages: [
+      {
+        name: "codemirror",
+        location: `${baseApi}/module/Editor/codemirror`,
+        main: "lib/codemirror"
+      }
+    ]
+  });
+
+  define("Editor", function(require, exports, module) {
+    /*
+    A module that includes a CodeMirror editing pane.
+    Note that this class handles autocompile, but {ProjectManager} handles autosave.
+
+    @extend Pane
+    @extend ModuleConfigObject
+    */
+    var $, CodeMirror, Editor, Logging, Pane, PanelLabel, Utils;
+    Pane = require("Pane");
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    PanelLabel = require("PanelLabel");
+    CodeMirror = require("codemirror");
+    require("codemirror/mode/verilog/verilog");
+    require("codemirror/addon/selection/active-line");
+    require("codemirror/addon/fold/foldcode");
+    require("codemirror/addon/fold/foldgutter");
+    require("codemirror/addon/fold/comment-fold");
+    require("codemirror/addon/fold/indent-fold");
+    require("codemirror/addon/search/search");
+    require("codemirror/addon/search/searchcursor");
+    require("codemirror/addon/search/jump-to-line");
+    Editor = (function() {
+      class Editor extends Pane {
+        constructor() {
+          super(...arguments);
+          /*
+          Triggers a compilation.
+          @param {Boolean} immediate `no` to wait a fixed amount of time before compiling,
+                           ignoring other compiles until then.
+          */
+          this.compile = this.compile.bind(this);
+        }
+
+        init(name, ide, project, tabbedview) {
+          return this.initPane("Editor", name, ide, project, tabbedview);
+        }
+
+        // @overridden
+        // Codemirror must be initialized into an element that exists in the DOM, so we initialize
+        // here, rather than in init(..).
+        initOpened() {
+          var actions;
+          this.codemirror();
+          actions = [
+            {
+              name: "Compile/Sim (<Ctrl>-Enter)",
+              href: `#${this.childPath("label-compile")}`
+            },
+            {
+              name: "Show Verilog",
+              href: `#${this.childPath("label-stats")}`
+            },
+            {
+              name: "Open Results",
+              href: `#${this.childPath("label-results")}`
+            }
+          ];
+          return this.addLabel({
+            initial: "E",
+            actions
+          }).then((label) => {
+            var el;
+            Utils.assert(this.label === label);
+            el = label.el;
+            el.off("click");
+            el.on("click", `[href='#${this.childPath("label-compile")}']`, (e) => {
+              console.log(`Compiling from ${this.childPath("label")}`);
+              e.preventDefault();
+              return this.compile();
+            });
+            el.on("click", `[href='#${this.childPath("label-stats")}']`, (e) => {
+              e.preventDefault();
+              if (!this.compiler) {
+                return;
+              }
+              return this.compiler.showStats();
+            });
+            el.on("click", `[href='#${this.childPath("label-results")}']`, (e) => {
+              e.preventDefault();
+              if (!this.compiler) {
+                return;
+              }
+              return this.compiler.showResults();
+            });
+            return this;
+          });
+        }
+
+        /*
+        Override for open.
+        TODO: Proper overriding doesn't work because we dont use coffeescript 'extends'.
+              No way to prevent calls to open(..).
+        @param tabbedview
+        @tlv TLV code to load into the Editor if truthy.
+        */
+        openTLV(tabbedview, tlv) {
+          return this.open(tabbedview).then(() => {
+            if (tlv) {
+              return this.setTLV(tlv, true, true);
+            }
+          });
+        }
+
+        /*
+        Load TLV code.
+        @param {String} tlv The TLV code to load into the editor.
+        @param {boolean} clear Whether to clear the history of the old contents.
+        @param {boolean} comp Whether to compile the code.
+        */
+        setTLV(tlv, clear, comp) {
+          this.setValue(tlv);
+          if (clear) {
+            this.editor.getDoc().clearHistory();
+          }
+          if (comp) {
+            return this.compile(true);
+          }
+        }
+
+        /*
+        Sets compiler.
+        @param {ServerCompile} compiler The value to set as compiler
+        @return Editor
+        */
+        setCompiler(compiler) {
+          this.compiler = compiler;
+          return this;
+        }
+
+        compile(immediate = false) {
+          var doCompile;
+          boundMethodCheck(this, Editor);
+          doCompile = () => {
+            if (!this.compiler) {
+              return;
+            }
+            this.setStatus("none");
+            this.compileChangeGeneration = this.editor.changeGeneration();
+            this.compiler.compile(this.editor.getValue(), function(id) {
+              return console.log(`Started compilation ${id}`);
+            });
+            return this._compileWait = null;
+          };
+          if (this._compileWait) {
+            return;
+          }
+          return this._compileWait = setTimeout(doCompile, (immediate ? 0 : 750));
+        }
+
+        /*
+        Initializes a CodeMirror instance inside the Editor.
+        */
+        codemirror() {
+          this.editor = CodeMirror($("[data-Editor]", this.paneEl).get(0), {
+            value: " ",
+            mode: "text/x-tlv",
+            theme: "tlv-basic",
+            lineNumbers: true,
+            matchBrackets: false,
+            smartIndent: true,
+            indentUnit: 3,
+            tabSize: 3,
+            electricChars: false,
+            styleActiveLine: true,
+            foldGutter: {
+              rangeFinder: new CodeMirror.fold.combine(CodeMirror.fold.indent, CodeMirror.fold.comment)
+            },
+            gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"],
+            extraKeys: this.keybindings()
+          });
+          this.editor.setValue("");
+          return this.editor.on('changes', () => {
+            this.hideLabel();
+            if (this.editor.isClean(this.compileChangeGeneration)) {
+              return this.setStatus("none");
+            } else {
+              this.setStatus("outdated");
+              if (this.constructor.AUTOCOMPILE) {
+                // TODO: AUTOCOMPILE is not currently in use, but if it is resurrected, it must be made more intelligent.
+                //       There should be a distinction between requested compiles and autocompiles, and autocompiles
+                //       shouldn't squash a requested one that is pending. Probably shouldn't autocompile if there is
+                //       a pending autocompile, either, until it completes.
+                return this.compile();
+              }
+            }
+          });
+        }
+
+        /*
+        Returns additional keybindings for CodeMirror.
+        @return {Object} An object in [Key Map](https://codemirror.net/doc/manual.html#keymaps) format.
+          `null` if no additional keybindings are desired.
+        */
+        keybindings() {
+          return {
+            "Ctrl-Enter": () => {
+              return this.compile(true);
+            },
+            "Alt-Enter": () => {
+              return this.compile(true);
+            }
+          };
+        }
+
+        /*
+        Sets the text showing in the text editor.
+        @param {String} str the text to insert into the editor
+        */
+        setValue(str) {
+          this.editor.setValue(str);
+          return setTimeout((() => {
+            return this.editor.refresh();
+          }), 10);
+        }
+
+        /*
+        Activate this tab.
+        */
+        activate() {
+          return this.tabbedview.activatePane(this);
+        }
+
+        /*
+        Set the cursor inside the editor.
+        @param {int|Object} line either the line number or `{line, ch}`
+        @param {int} char the character position
+        */
+        setCursor(line, char) {
+          return this.editor.setCursor(line, char);
+        }
+
+        /*
+        Return the number of lines in the document.
+        @return {int} the number of lines in the editor.
+        */
+        lineCount() {
+          return this.editor.lineCount();
+        }
+
+      };
+
+      // @property {Boolean} `true` if compile should be triggered on keystroke
+      Editor.AUTOCOMPILE = false;
+
+      // @property {int} the "change generation" (see codemirror) of the last compile.
+      Editor.prototype.compileChangeGeneration = -1;
+
+      // @property {ServerCompile} The compiler.
+      Editor.prototype.compiler = null;
+
+      return Editor;
+
+    }).call(this);
+    Utils.extend(Editor, module.config(), true, true);
+    return Editor;
+  });
+
+}).call(this);

@@ -1,0 +1,515 @@
+(function() {
+  var $, Promise, WaveData,
+    boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  [$, Promise, WaveData] = [];
+
+  define("Project", function(require, exports, module) {
+    /*
+    Represents a project (currently one per Makerchip session).
+    This extends ProjectManager, which provides the interface with the server.
+    */
+    /*
+    A module that handles projects.
+    This class is mainly responsible for interfacing with the server.
+    Project extends this with client-side capabilities for a project (currently one per browser session).
+
+    @extend ModuleConfigObject
+    */
+    var EventEmitter, Project, ProjectManager, Utils, messages, regexes;
+    $ = require("jquery");
+    Utils = require("Utils");
+    Promise = require("bluebird");
+    EventEmitter = require("Project/eventemitter");
+    WaveData = require("VCD");
+    
+    // Regular expression for project URLs.
+    regexes = {
+      sandboxUserProject: /^\/sandbox(\/nda|\/alpha)?\/([a-zA-Z0-9][a-zA-Z0-9\.-_]*)\/([a-zA-Z0-9][a-zA-Z0-9\.-_]*)/
+    };
+    messages = {
+      confirmDelete: `Are you sure you want to delete this project?  This is final, and can't be undone.\n
+Click 'OK' to permanantly delete your project.`,
+      confirmUnsavedPending: `Autosave pending. Click 'cancel' or 'stay on this page' to ensure your changes are saved.`,
+      confirmUnsaved: `Latest changes are unsaved.  Click 'cancel' or 'stay on this page' to ensure your changes are saved.`
+    };
+    ProjectManager = (function() {
+      class ProjectManager {
+        constructor() {
+          /*
+          Listen for saves, if components are available and not doing so already.
+          */
+          this.initSave = this.initSave.bind(this);
+          /*
+          Post a project to the server, either as a save, new project, or clone.
+          @param {String} url the URL string of the post
+          @param {String} action the name of the action (starting w/ upper-case)
+          @param {String} oldPath the value of path prior to the action resulting in this post
+          @return {Promise<res, postData} a promise returning {res, postData} or throwing an {Error}.
+          */
+          this.postProject = this.postProject.bind(this);
+          /*
+          Save the project.
+          @param {String} path the @path that triggered the save.
+          @return {Promise}
+          */
+          this.save = this.save.bind(this);
+          // A save is needed
+          this.saveNeeded = this.saveNeeded.bind(this);
+          /*
+          Determines if the current user can edit the file.
+          @param {Boolean} force require a new query to the server
+          @return {Promise<Boolean>} `true` if the user can edit.
+          */
+          this.canEdit = this.canEdit.bind(this);
+          /*
+          Safe to call anytime to ensure that a save is or has been posted for the current editor contents.
+          */
+          this.forceSave = this.forceSave.bind(this);
+          $(window).on("popstate", (event) => {
+            // We pushState for new projects, and only for new projects, except that pushState seems to . But
+            // we cannot transition between projects without a reload. So, all popstate's force a reload.
+            // Old browsers may throw this event on reload, but we shouldn't be listening at that point,
+            // so we should not get stuck in an infinite reload cycle.
+
+            // Make sure contents are saved. This will not save if ! @_canEdit, but it's too late to prompt and turn
+            // back. The browser has already gone to the new URL, and I don't know a convenient way to
+            // restore the old one. I guess it could be stored in the history.state. It's rare the someone
+            // would navigate away from someone else's project without an unload anyway (which does alert).
+            // That would require opening the project, creating a new project, returning to the other project,
+            // editing, and navigating.
+            if ((event.originalEvent.state != null) && typeof event.originalEvent.state.path !== "undefined" && event.originalEvent.state.path !== this.path) { // Note, this can be true for null paths.
+              // Navigated to a different project.
+              this.forceSave();
+              this._forceUnload = true; // used to avoid save changes dialog
+              // Reload. It seems we need to schedule the reload in the event queue in order for the post request
+              // for the save to go out successfully (at least in Firefox).
+              return setTimeout((function() {
+                return window.location.reload();
+              }), 0);
+            }
+          });
+        }
+
+        /*
+        @return the URL for the project
+        */
+        url() {
+          return `/project/${this.user}/${this.path}`;
+        }
+
+        /*
+        @return {Promise<ProjectManager>}
+        */
+        init() {
+          var matches, url;
+          if (matches = window.location.pathname.match(regexes.sandboxUserProject)) {
+            [url, this.access_level, this.user, this.path] = matches;
+            this._firstInit = true;
+            this.attach();
+          }
+          $("body").on("click", "[href='#new-project']", (e) => {
+            e.preventDefault();
+            this.newProject();
+            this.initSave();
+            return this.attach();
+          });
+          $("body").on("click", "[href='#clone-project']", (e) => {
+            e.preventDefault();
+            this.cloneProject();
+            return this.attach();
+          });
+          $("body").on("click", "[href='#delete-project']", (e) => {
+            e.preventDefault();
+            if (confirm(messages.confirmDelete)) {
+              this.deleteProject();
+              return this.detach();
+            }
+          });
+          window.onbeforeunload = () => {
+            // Warn about unsaved changes before closing. If the unload was caused by a navigation to a new
+            // project URL and the user cancels the reload we requested, they will be left at the new URL
+            // in their old project. This is bad. When attempting to reload, we post the load and set a flag
+            // to avoid asking here (so don't wait for the save response and ignore any typing between events).
+            if (this._editor && !this._editor.editor.isClean(this.saveChangeGeneration) && !this._forceUnload) {
+              messages.confirmUnsaved;
+            }
+            //Detach from the project before tab close.
+            return this.detach();
+          };
+          return Promise.resolve(this);
+        }
+
+        /*
+        Attaches the editor to the project.
+        Refer to: Project -> editorAttached property.
+        */
+        attach() {
+          return $.post(`/project/${this.user}/${this.path}/attach`, "");
+        }
+
+        /*
+        Detaches the editor from the project.
+        Refer to: Project -> editorAttached property.
+        */
+        detach() {
+          return navigator.sendBeacon(`/project/${this.user}/${this.path}/detach`, "");
+        }
+
+        initSave() {
+          if (!this._editor || this._initSave_listening) {
+            return;
+          }
+          this._initSave_listening = true;
+          this._saveState = null; // Assume current state has been successfully saved.
+          // When changes are made, makes certain a save will be performed soon.
+          return this._editor.editor.on("changes", () => {
+            return this.saveNeeded();
+          });
+        }
+
+        postProject(url, action, oldPath) {
+          var changeGeneration, fileObj, postDate;
+          this._saveState = "posted"; // Note that save state now reflects the project of this post.
+          changeGeneration = this._editor.editor.changeGeneration(false);
+          postDate = new Date();
+          fileObj = {
+            source: this._editor.editor.getValue()
+          };
+          return Promise.join($.post(url, fileObj, "json"), Promise.resolve({changeGeneration, postDate, path: this.path, oldPath})).then(([res, postData]) => {
+            if (res.err) {
+              throw new Error(res.err);
+            }
+            if (this.path === postData.path) { // If @path has been changed, @ reflects the new path; don't touch it.
+              // TODO: We used to use "lastEdit" from the response, but it is no longer used.
+              //       Maybe it should be eliminated from the response (and tests)?
+              this.saveChangeGeneration = postData.changeGeneration;
+              this._saveState = null;
+              if (!this._editor.editor.isClean(postData.changeGeneration)) {
+                this.saveNeeded();
+              }
+              this.emit("saved", postData.postDate);
+              return {res, postData};
+            }
+          }).catch((err) => {
+            this._saveState = false;
+            this.saveChangeGeneration = -1; // assuming editor.isClean(-1) will be false
+            if (err.status && err.status === 422) {
+              this.emit("app error");
+            } else {
+              this.emit("save error");
+            }
+            return console.log(`${action} failed.`);
+          });
+        }
+
+        save(path) {
+          // Do nothing if path has changed, in which case save should have been forced already.
+          if (this.path !== path) {
+            return;
+          }
+          // Always save from "pending" state (unless project (path) has changed, and the pending save is stale)
+          if (this._saveState !== "pending") {
+            console.log("Bug: Saving when no save is pending");
+          }
+          if (this._editor.editor.isClean(this.saveChangeGeneration)) {
+            // Nothing to save.
+            this._saveState = null;
+            return;
+          }
+          this.emit("saving");
+          return this.postProject(`${this.url()}/save/`, "Save", this.path);
+        }
+
+        saveNeeded() {
+          if (!this.user || !this.path) {
+            return this._saveState = "modified"; // indicating unsaved changes.
+          } else {
+            return this.canEdit().then((canEdit) => {
+              var path, thisSave;
+              if (!canEdit) {
+                this._saveState = "modified"; // unsaved changes.
+                return;
+              }
+              if (!this._saveState || this._saveState === "modified") {
+                this._saveState = "pending";
+                // Save after timeout for the current path (project). Use higher timeout if the last save failed.
+                thisSave = this.save;
+                path = this.path;
+                return setTimeout((function() {
+                  return thisSave(path);
+                }), this.constructor.AUTOSAVE_MS * (this._saveState === false ? 3 : 1));
+              }
+            });
+          }
+        }
+
+        /*
+        Save a reference to an editor.
+        @param {Editor} _editor
+        @return {Promise<ProjectManager>}
+        */
+        editor(_editor) {
+          this._editor = _editor;
+          if (this._firstInit) {
+            this._firstInit = false;
+            this.getProject();
+          }
+          this._initSave_listening = false;
+          this.initSave();
+          return this;
+        }
+
+        canEdit(force = false) {
+          if ((this._canEdit != null) && !force) {
+            //console.debug "Save permission cached (can edit: #{@_canEdit}), not forcing update."
+            return Promise.resolve(this._canEdit);
+          }
+          return Promise.resolve($.getJSON(`${this.url()}/canEdit/`)).then(({id, canEdit}) => {
+            return this._canEdit = canEdit;
+          }).catch((err) => {
+            var error;
+            if (err.status && err.status === 400) {
+              this._canEdit = false;
+              try {
+                console.log(JSON.parse(err.responseText).err);
+              } catch (error1) {
+                error = error1;
+                console.log("Unable to save.");
+              }
+              return Promise.resolve(false);
+            }
+            throw err;
+          });
+        }
+
+        /*
+        Get the contents and metadata for the current URL and set the value of the editor.
+        */
+        getProject() {
+          this.projectAnalytics("open");
+          return Promise.resolve($.get(`${this.url()}/contents/`, "json")).then(({id, name, value, lastEdit, vcd}) => {
+            if (this._canEdit === true) {
+              this.emit("saved", new Date());
+            }
+            if (name !== null) {
+              document.title = name + " - " + document.title;
+            }
+            // For "debug mode"
+            // If VCD data is present in the response, we set
+            // the corresponding project flag and emit the waveform.
+            if (vcd != null) {
+              this.vcd = true;
+              this.emit("vcd", new WaveData(vcd, false));
+            }
+            this._editor.setValue(value);
+            this._editor.compile(true);
+            this._editor.editor.getDoc().clearHistory();
+            return this.saveChangeGeneration = this._editor.editor.changeGeneration(true);
+          }).catch(function(err) {
+            return console.log(`Error fetching project: ${err}`);
+          });
+        }
+
+        /*
+        Update Google Analytics about a new project.
+        @param {String} action the type of action taken, e.g. `"create"`, `"clone"`
+        */
+        projectAnalytics(action) {
+          if (typeof window.ga !== "function") {
+            return;
+          }
+          return window.ga("send", {
+            hitType: "event",
+            eventCategory: "Projects",
+            eventAction: action,
+            eventLabel: `${this.user}/${this.path}`
+          });
+        }
+
+        /*
+        Updates the window URL to the path provided.  If Google Analytics is loaded, also update analytics.
+        @param {Object} post response, containing {id, url, user, path} for the new page/project
+        @param {String} oldPath the path reflecting the project prior to the change
+        @param {String} gaMessage message for Google Analytics for this event
+        */
+        changeProject(res, oldPath, gaMessage) {
+          var id, path, url;
+          ({id, url, user: this.user, path} = res);
+          window.history.replaceState({
+            path: oldPath
+          }, null, window.location);
+          this.path = path;
+          window.history.pushState({path: this.path}, null, url);
+          this.projectAnalytics(gaMessage);
+          this._saveState = null;
+          this.canEdit(true);
+          if (typeof window.ga === "function") {
+            return window.ga("send", "pageview", location.pathname);
+          }
+        }
+
+        forceSave() {
+          if ((this._canEdit != null) && this._canEdit && this._editor && this.user && this.path && this._saveState === "pending") {
+            return this.save(this.path);
+          } else {
+
+          }
+        }
+
+        //console.debug "Can't force a save (#{@_canEdit}, #{@_editor}, #{@user}, #{@path}, #{@_saveState})."
+        /*
+        Generate a new project.
+        */
+        newProject() {
+          var oldPath;
+          this.forceSave(); // (Should do nothing because there is no current project to save.)
+          oldPath = this.path;
+          this.path = null; // to prevent saves and state updates for old project
+          return this.postProject("/project/", "New project", oldPath).then((stuff) => {
+            this.changeProject(stuff.res, stuff.postData.oldPath, "create");
+            return window.alert("Be sure to bookmark this new project URL if you'll want to return to your work.");
+          }).catch((function(err) {}));
+        }
+
+        /*
+        Clone the current project.
+        */
+        cloneProject() {
+          var oldPath, url;
+          if (!this.user || !this.path) {
+            return;
+          }
+          this.forceSave();
+          url = this.url();
+          oldPath = this.path;
+          this.path = null; // to prevent saves and state updates for old project
+          this.projectAnalytics("clone");
+          return this.postProject(`${url}/clone/json/`, "Clone", oldPath).then((stuff) => {
+            this.changeProject(stuff.res, stuff.postData.oldPath, "create from clone");
+            return window.alert("You are now working in a clone.\n" + "Be sure to bookmark this new URL if you'll want to return to your work.");
+          }).catch((function(err) {}));
+        }
+
+        /*
+        Delete the current project.
+        */
+        deleteProject() {
+          if (!this.user || !this.path) {
+            return;
+          }
+          return Promise.resolve($.get(`${this.url()}/delete/`, "json")).then(({
+              id,
+              url,
+              user,
+              path: path1
+            }) => {
+            this.user = user;
+            this.path = path1;
+            this.projectAnalytics("delete");
+            return window.location = `/sandbox${this.access_level}/`;
+          });
+        }
+
+      };
+
+      // @property {String} "", "/alpha", or "/nda".
+      //     "": Public permissions.
+      //     "/alpha": Alpha features behind a password for consumers and testers who understand the alpha
+      //               nature of the features.
+      //     "/nda": confidential content can be displayed.
+      ProjectManager.prototype.access_level = null;
+
+      // @property {String} the current username/shortid
+      ProjectManager.prototype.user = null;
+
+      // @property {String} the current project path/shortid
+      ProjectManager.prototype.path = null;
+
+      // @property {Boolean} true if a VCD file is associated with the project ("debug mode").
+      // In debug mode, where the VCD data is present in the project contents response, the vcd data is emitted
+      // immediately to be processed by the waveform viewer and viz pane, without performing simulation (which
+      // would otherwise emit the VCD upon completion).
+      ProjectManager.prototype.vcd = false;
+
+      // @property {int} after keystroke, save after this delay
+      ProjectManager.AUTOSAVE_MS = 4000;
+
+      // @property {int} the "change generation" (see codemirror) of the last successful save.
+      ProjectManager.prototype.saveChangeGeneration = -1;
+
+      // State of save state machine:
+      //   null: no changes to save
+      //   "modified": unsaved changes
+      //   "pending": save will be kicked off after timeout;
+      //              modifications need no action during this state
+      //   "posted": save has been posted to the server;
+      //             modifications need no action during this state;
+      //             at/after this state modifications will be saved
+      //   false: the last save failed
+      // Note that codemirror and *ChangeGeneration variables are used to determine if there are
+      // changes to save.
+      // Modifications need no action during "pending" (because a save will be done) and "posted" (because
+      // response will trigger a save check).
+      ProjectManager.prototype._saveState = null;
+
+      ProjectManager.prototype._forceUnload = false;
+
+      return ProjectManager;
+
+    }).call(this);
+    Project = (function() {
+      class Project extends ProjectManager {
+        constructor() {
+          super("Project");
+          /*
+          Associate the IDE.
+          @param {IDE} ide The IDE.
+          */
+          this.initIDE = this.initIDE.bind(this);
+        }
+
+        initIDE(ide) {
+          boundMethodCheck(this, Project);
+          this.ide = ide;
+          this.editorPane = this.ide.editor;
+          this.navTlvPane = this.ide.navtlv;
+          this.graphPane = this.ide.graph;
+          this.waveformPane = this.ide.viewer;
+          this.vizPane = this.ide.viz;
+          return this.logPane = this.ide.errorlog;
+        }
+
+      };
+
+      // @Property {IDE} the IDE.
+      Project.prototype.ide = null;
+
+      // @property {Editor} the Editor
+      Project.prototype.editorPane = null;
+
+      // @property {NavTLV} the NavTLV pane
+      Project.prototype.navTlvPane = null;
+
+      // @property {Graph} the Editor
+      Project.prototype.graphPane = null;
+
+      // @property {WaveformViewer} the WaveformViewer
+      Project.prototype.waveformPane = null;
+
+      // @property {VizPane} the VIZ pane
+      Project.prototype.vizPane = null;
+
+      // @property {ErrorLog} the log pane
+      Project.prototype.logPane = null;
+
+      return Project;
+
+    }).call(this);
+    //Project:: = $.extend {}, EventEmitter::, module.config(), Project::
+    Utils.extend(Project, module.config());
+    Utils.extend(Project, EventEmitter.prototype);
+    return Project;
+  });
+
+}).call(this);
